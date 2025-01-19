@@ -1,0 +1,8 @@
+torch
+torchvision
+torchmetrics
+numpy
+tqdm
+opencv-python
+h5py
+scipy
