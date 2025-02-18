@@ -188,7 +188,7 @@ class SegModel(Core):
         total_epochs = num_epochs
 
         first_metric = list(self.metrics.keys())[0]
-        best_val = None
+
 
         for epoch in range(current_epoch + 1, total_epochs + 1):
             self.logger.info(f"\nStarting epoch {epoch}/{total_epochs}")
@@ -202,8 +202,14 @@ class SegModel(Core):
                 self.optimizer.zero_grad()
                 outputs = self(images)
 
+                if isinstance(outputs, tuple):
+                    outputs = outputs[-1]  # 获取最终输出 out0
+
+                
                 if outputs.size(1) != self.num_classes:
                     raise ValueError(f"Expected outputs with {self.num_classes} classes, got {outputs.size(1)}")
+
+
 
                 loss = self.criterion(outputs, masks)
                 loss.backward()
@@ -308,6 +314,9 @@ class SegModel(Core):
                 images = images.to(device)
                 masks = masks.to(device)
                 outputs = self(images)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[-1]  # 获取最终输出 out0
+
 
                 if outputs.size(1) != self.num_classes:
                     raise ValueError(f"Expected outputs with {self.num_classes} classes, got {outputs.size(1)}")

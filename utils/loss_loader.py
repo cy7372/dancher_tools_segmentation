@@ -29,8 +29,10 @@ def get_loss(args):
                 raise ValueError("The number of loss weights must match the number of losses.")
             return CombinedLoss(losses, loss_weights)
         else:
-            raise ValueError("Multiple losses specified without corresponding weights.")
-    
+            # 如果没有提供权重，默认平分
+            loss_weights = [1.0 / len(losses)] * len(losses)
+            return CombinedLoss(losses, loss_weights)
+
     return losses[0] if len(losses) == 1 else losses
 
 

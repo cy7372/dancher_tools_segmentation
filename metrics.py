@@ -12,11 +12,8 @@ def mIoU(predicted, target, num_classes):
         intersection = torch.logical_and(pred_cls, tgt_cls).float().sum()
         union = torch.logical_or(pred_cls, tgt_cls).float().sum()
 
-        if union == 0:
-            iou = 1.0  # 类别在预测和目标中均未出现，设为完美分数
-            # print(f"Class {cls} not present in predictions and targets. Setting IoU to 1.0")
-        else:
-            iou = (intersection / (union + EPSILON)).item()
+
+        iou = (intersection / (union + EPSILON)).item()
             # print(f"Class {cls}: Intersection = {intersection.item()}, Union = {union.item()}, IoU = {iou}")
         iou_scores.append(iou)
     return iou_scores
