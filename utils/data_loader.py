@@ -15,6 +15,7 @@ from scipy.ndimage import zoom
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 import torch
+from dancher_tools_segmentation.utils.hdf5_dataset import HDF5Dataset
 
 # ---------------------------------------------------------
 # 1. 数据集注册表
@@ -123,103 +124,105 @@ def is_cache_valid(cache_path, module_paths):
 
 def process_file(args):
     """
-    处理单个文件并返回裁剪块或单图。
+    修改后的 process_file：将 process_data 的生成器输出以分块方式返回，
+    每块包含 chunk_size 个裁剪结果，以减少一次性内存占用。
+    
+    :param args: (dataset_name, filename, images_dir, masks_dir, img_size)
+    :return: 一个包含多个元组的列表，每个元组为 (images_list, masks_list)
     """
     dataset_name, filename, images_dir, masks_dir, img_size = args
 
     # 获取数据集类
     dataset_class = DatasetRegistry.get_dataset(dataset_name)
 
-    # 调用数据集类的方法
-    try:
-        result = dataset_class.process_data(filename, images_dir, masks_dir, img_size)
-    except Exception as e:
-        print(f"[ERROR] Processing failed for file: {filename} with error: {e}")
-        raise e
+    chunk_size = 100  # 根据实际内存情况调整块大小
+    imgs = []
+    masks = []
+    chunks = []
 
-    if isinstance(result[0], list):  # 检查是否是裁剪结果
-        return result
-    else:  # 单图包装为列表
-        return [result[0]], [result[1]]
+    # 使用生成器逐个获取裁剪块
+    for cropped_image, processed_mask in dataset_class.process_data(filename, images_dir, masks_dir, img_size):
+        imgs.append(cropped_image)
+        masks.append(processed_mask)
+        if len(imgs) >= chunk_size:
+            chunks.append((imgs, masks))
+            imgs = []
+            masks = []
+    if imgs:
+        chunks.append((imgs, masks))
+    return chunks
 
 # ---------------------------------------------------------
 # 3. 缓存与数据构建逻辑
 # ---------------------------------------------------------
 def create_cache(datapack, path, img_size, cache_path, module_paths):
     """
-    根据指定的目录读取所有图像与掩码，处理后保存到缓存文件（异步存储）。
-    兼容普通数据集和裁剪型数据集，自动适配裁剪逻辑。
-
-    :param datapack: 该数据集的类（内含 color_map 等）
-    :param path: 数据目录路径
-    :param img_size: 输出图像大小
-    :param cache_path: 缓存文件存放路径
-    :param module_paths: list, 用于生成数据的模块文件路径
-    :return: dict，包括 'images' 和 'masks'
+    修改后的 create_cache：逐个处理图像文件，处理后直接写入 HDF5 缓存，
+    避免一次性采集所有子进程返回的数据造成内存峰值，从而降低被 OOM killer 终止的风险。
+    
+    :param datapack: 数据集类
+    :param path: 数据目录根路径
+    :param img_size: 裁剪尺寸
+    :param cache_path: 缓存文件保存路径
+    :param module_paths: 用于生成 MD5 校验的模块文件路径列表
     """
+    import gc
     images_dir = os.path.join(path, 'images')
     masks_dir = os.path.join(path, 'masks')
     images_files = sorted(os.listdir(images_dir))
+    
+    # 获取数据集名称，用于 process_file 调用
+    dataset_name = datapack.dataset_name
 
-    if hasattr(datapack, 'color_map'):
-        color_map = getattr(datapack, 'color_map')
-    else:
-        raise ValueError(
-            f"The dataset {datapack.__name__} must define a 'color_map' attribute."
-        )
+    with h5py.File(cache_path, 'w') as f:
+        dset_images = None
+        dset_masks = None
+        current_index = 0
 
-    if not isinstance(color_map, dict):
-        raise ValueError("The dataset's color_map must be a dictionary.")
+        # 顺序处理每个图像文件，避免一次收集所有进程返回数据
+        for filename in tqdm(images_files, desc=f"Processing images in {path}"):
+            # 直接调用 process_file 处理单个图像文件
+            file_chunks = process_file((dataset_name, filename, images_dir, masks_dir, img_size))
+            # file_chunks 是列表，每个元素为 (images_list, masks_list)
+            for images_list, masks_list in file_chunks:
+                images_arr = np.array(images_list, dtype=np.float32)  # (n, H, W, C)
+                masks_arr = np.array(masks_list, dtype=np.uint8)       # (n, H, W)
+                if dset_images is None:
+                    dset_images = f.create_dataset(
+                        'images',
+                        data=images_arr,
+                        maxshape=(None,) + images_arr.shape[1:],
+                        chunks=True,
+                        dtype='float32'
+                    )
+                    dset_masks = f.create_dataset(
+                        'masks',
+                        data=masks_arr,
+                        maxshape=(None,) + masks_arr.shape[1:],
+                        chunks=True,
+                        dtype='uint8'
+                    )
+                    current_index = images_arr.shape[0]
+                else:
+                    new_size = current_index + images_arr.shape[0]
+                    dset_images.resize((new_size,) + images_arr.shape[1:])
+                    dset_masks.resize((new_size,) + masks_arr.shape[1:])
+                    dset_images[current_index:new_size] = images_arr
+                    dset_masks[current_index:new_size] = masks_arr
+                    current_index = new_size
 
-    # 初始化用于存储的图像和掩码列表
-    all_images = []
-    all_masks = []
+                # 尽快释放中间变量
+                del images_arr, masks_arr, images_list, masks_list
+            # 每处理完一个文件调用垃圾回收
+            gc.collect()
 
-    # 构建并行处理所需参数
-    args_list = [
-        (datapack.dataset_name, filename, images_dir, masks_dir, img_size)
-        for filename in images_files
-    ]
+        # 写入当前用于 MD5 校验的文件属性
+        module_md5 = ','.join([calculate_md5(p) for p in module_paths])
+        f.attrs['md5'] = module_md5
+        f.flush()
 
-    # 并行处理图像与掩码
-    with ProcessPoolExecutor() as executor:
-        results = list(tqdm(
-            executor.map(process_file, args_list),
-            desc=f"Processing images in {path}",
-            total=len(images_files)
-        ))
-
-    # 遍历结果并存储所有图像和掩码
-    for i, result in enumerate(results):
-        if isinstance(result[0], list) and isinstance(result[1], list):
-            # 如果返回的是裁剪块列表，逐块添加
-            all_images.extend(result[0])  # 裁剪后的多块图像
-            all_masks.extend(result[1])  # 裁剪后的多块掩码
-        else:
-            # 普通数据集返回单个图像和掩码
-            all_images.append(result[0])  # 单图像
-            all_masks.append(result[1])  # 单掩码
-
-    # 将所有图像和掩码转换为 NumPy 数组
-    all_images = np.array(all_images, dtype=np.float32)  # (N, H, W, C)
-    all_masks = np.array(all_masks, dtype=np.uint8)      # (N, H, W)
-
-    # 打印最终的形状调试信息
-    # print(f"[INFO] Total processed images: {all_images.shape}")
-    # print(f"[INFO] Total processed masks: {all_masks.shape}")
-
-    # 计算 MD5 并保存缓存
-    module_md5 = ','.join([calculate_md5(p) for p in module_paths])
-
-    def save():
-        with h5py.File(cache_path, 'w') as f:
-            f.create_dataset('images', data=all_images, dtype='float32')
-            f.create_dataset('masks', data=all_masks, dtype='uint8')
-            f.attrs['md5'] = module_md5
-
-    Thread(target=save).start()
-
-    return {'images': all_images, 'masks': all_masks}
+    # 这里不加载全部数据到内存，后续使用 HDF5Dataset 的懒加载方式
+    return
 
 
 # ---------------------------------------------------------
@@ -230,8 +233,6 @@ def get_dataloaders(args):
     通用数据加载器生成函数。可以加载指定数据集，并在首次加载时自动生成缓存。
 
     :param args: 包含训练配置和数据集配置的参数对象
-                 - args.ds: 单个数据集的配置(dict)，包含 'name', 'train_paths', 'test_paths' 等
-                 - args.batch_size, args.num_workers, args.img_size 等
     :return: (train_loader, test_loader)
     """
     batch_size = args.batch_size
@@ -246,8 +247,7 @@ def get_dataloaders(args):
     DatasetRegistry.load_dataset_module(dataset_name)
     datapack = DatasetRegistry.get_dataset(dataset_name)
 
-    # 生成 module_paths 供 MD5 校验
-    # 包含数据集模块和 data_loader.py 本身
+    # 生成 module_paths 供 MD5 校验（包含数据集模块和 data_loader.py 本身）
     data_loader_path = os.path.abspath(__file__)
     dataset_module_path = os.path.join('datapacks', f'{dataset_name}.py')
     module_paths = [
@@ -260,34 +260,20 @@ def get_dataloaders(args):
     # -- 1) 加载训练数据
     for train_path in dataset_config.get('train_paths', []):
         train_cache_path = os.path.join(train_path, "__cache__.h5")
-        if is_cache_valid(train_cache_path, module_paths):
-            with h5py.File(train_cache_path, 'r') as f:
-                images = f['images'][:]
-                masks = f['masks'][:]
-                train_data = {'images': images, 'masks': masks}
-        else:
-            train_data = create_cache(
-                datapack, train_path, img_size,
-                train_cache_path, module_paths
-            )
-        train_dataset = datapack(train_data)  # IWDataset 实例化
+        if not is_cache_valid(train_cache_path, module_paths):
+            create_cache(datapack, train_path, img_size,
+                         train_cache_path, module_paths)
+        # 使用 HDF5Dataset, 避免一次性将全部数据加载内存
+        train_dataset = HDF5Dataset(train_cache_path)
         train_datasets.append(train_dataset)
 
     # -- 2) 加载测试数据
     for test_path in dataset_config.get('test_paths', []):
         test_cache_path = os.path.join(test_path, "__cache__.h5")
-        if is_cache_valid(test_cache_path, module_paths):
-            # print(f"[DEBUG] Cache valid for testing path: {test_path}")
-            with h5py.File(test_cache_path, 'r') as f:
-                images = f['images'][:]
-                masks = f['masks'][:]
-                test_data = {'images': images, 'masks': masks}
-        else:
-            test_data = create_cache(
-                datapack, test_path, img_size,
-                test_cache_path, module_paths
-            )
-        test_dataset = datapack(test_data)  # IWDataset 实例化
+        if not is_cache_valid(test_cache_path, module_paths):
+            create_cache(datapack, test_path, img_size,
+                         test_cache_path, module_paths)
+        test_dataset = HDF5Dataset(test_cache_path)
         test_datasets.append(test_dataset)
 
     # 组装 ConcatDataset
